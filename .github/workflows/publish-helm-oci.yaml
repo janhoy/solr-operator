@@ -17,6 +17,15 @@
 
 name: Publish Helm Charts to OCI Registry
 
+# Publishes already-released, already-voted-on Helm charts from dist.apache.org to the
+# GitHub Container Registry, as OCI artifacts.
+#
+# The charts on dist.apache.org remain the canonical, signed release artifacts; the OCI
+# copies are convenience binaries. This workflow therefore never builds a chart, it only
+# re-publishes a verified copy of one that has already been released.
+#
+# This workflow is also used to backfill previously released versions.
+
 on:
   workflow_dispatch:
     inputs:
@@ -29,13 +38,24 @@ on:
         required: true
         type: string
       dry-run:
-        description: 'Dry run - download and verify charts but do not push to OCI registry'
+        description: 'Dry run - download and verify charts but do not push to the OCI registry'
         required: false
         type: boolean
         default: false
 
 permissions:
   contents: read
+  packages: write
+
+env:
+  # 'helm push' appends the chart name from Chart.yaml to this target, producing:
+  #   ghcr.io/apache/solr-operator/helm/solr-operator
+  #   ghcr.io/apache/solr-operator/helm/solr
+  # The charts are namespaced under the repository name because ghcr.io/apache/* is a
+  # single namespace shared by every ASF project. Keeping the charts here also leaves
+  # 'apache/solr' free for a future Solr server image.
+  OCI_TARGET: oci://ghcr.io/apache/solr-operator/helm
+  ASF_KEYS_URL: https://dist.apache.org/repos/dist/release/solr/KEYS
 
 jobs:
   publish-oci:
@@ -43,156 +63,184 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: 'latest'
 
-      - name: Login to Docker Hub
-        if: ${{ !inputs.dry-run }}
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USER }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Validate Input URLs
+      # Inputs are passed through the environment rather than interpolated into the
+      # script body, so that a malicious input cannot inject shell commands.
+      - name: Validate input URLs
+        id: inputs
+        env:
+          OPERATOR_CHART_URL: ${{ inputs.solr-operator-chart-url }}
+          SOLR_CHART_URL: ${{ inputs.solr-chart-url }}
         run: |
-          # Validate URLs are from expected Apache dist domain
-          if [[ ! "${{ inputs.solr-operator-chart-url }}" =~ ^https://dist\.apache\.org/repos/dist/(release|dev)/solr/ ]]; then
-            echo "Error: solr-operator-chart-url must be from dist.apache.org"
+          set -euo pipefail
+
+          for url in "${OPERATOR_CHART_URL}" "${SOLR_CHART_URL}"; do
+            if [[ ! "${url}" =~ ^https://dist\.apache\.org/repos/dist/(release|dev)/solr/ ]]; then
+              echo "Error: chart URLs must be from dist.apache.org: ${url}" >&2
+              exit 1
+            fi
+          done
+
+          # The .sha512 and .prov files both reference the chart's original filename, so
+          # the downloads must keep their basenames rather than being renamed.
+          OPERATOR_CHART_FILE="$(basename "${OPERATOR_CHART_URL}")"
+          SOLR_CHART_FILE="$(basename "${SOLR_CHART_URL}")"
+
+          if [[ ! "${OPERATOR_CHART_FILE}" =~ ^solr-operator-[0-9][A-Za-z0-9.+_-]*\.tgz$ ]]; then
+            echo "Error: unexpected solr-operator chart filename: ${OPERATOR_CHART_FILE}" >&2
             exit 1
           fi
-          if [[ ! "${{ inputs.solr-chart-url }}" =~ ^https://dist\.apache\.org/repos/dist/(release|dev)/solr/ ]]; then
-            echo "Error: solr-chart-url must be from dist.apache.org"
+          if [[ ! "${SOLR_CHART_FILE}" =~ ^solr-[0-9][A-Za-z0-9.+_-]*\.tgz$ ]]; then
+            echo "Error: unexpected solr chart filename: ${SOLR_CHART_FILE}" >&2
             exit 1
           fi
-          echo "✓ URLs validated"
 
-      - name: Download Helm Charts
+          echo "operator-chart-file=${OPERATOR_CHART_FILE}" >> "$GITHUB_OUTPUT"
+          echo "solr-chart-file=${SOLR_CHART_FILE}" >> "$GITHUB_OUTPUT"
+          echo "URLs validated"
+          echo "  solr-operator chart: ${OPERATOR_CHART_FILE}"
+          echo "  solr chart:          ${SOLR_CHART_FILE}"
+
+      - name: Download charts, checksums, signatures and provenance
+        env:
+          OPERATOR_CHART_URL: ${{ inputs.solr-operator-chart-url }}
+          SOLR_CHART_URL: ${{ inputs.solr-chart-url }}
         run: |
-          set -e
-          echo "Downloading solr-operator chart from: ${{ inputs.solr-operator-chart-url }}"
-          curl --fail --show-error --location --retry 3 --retry-delay 5 \
-            -o solr-operator.tgz "${{ inputs.solr-operator-chart-url }}"
+          set -euo pipefail
+          mkdir -p charts && cd charts
 
-          echo "Downloading solr chart from: ${{ inputs.solr-chart-url }}"
-          curl --fail --show-error --location --retry 3 --retry-delay 5 \
-            -o solr.tgz "${{ inputs.solr-chart-url }}"
+          # The .prov file is what makes 'helm install --verify' work against the OCI
+          # copy: 'helm push' uploads it automatically when it sits next to the chart.
+          for url in "${OPERATOR_CHART_URL}" "${SOLR_CHART_URL}"; do
+            for suffix in "" .sha512 .asc .prov; do
+              curl --fail --show-error --silent --location --retry 3 --retry-delay 5 \
+                -O "${url}${suffix}"
+            done
+          done
 
-          echo "Charts downloaded successfully:"
-          ls -lh *.tgz
+          echo "Downloaded:"
+          ls -lh
 
-          # Verify they are valid tar files
-          echo "Verifying chart integrity..."
-          tar -tzf solr-operator.tgz > /dev/null
-          tar -tzf solr.tgz > /dev/null
-          echo "✓ Charts are valid tarballs"
-
-      - name: Download and Verify Checksums
+      - name: Verify SHA512 checksums
+        working-directory: charts
         run: |
-          set -e
-          echo "Downloading checksums..."
+          set -euo pipefail
+          sha512sum -c ./*.tgz.sha512
+          echo "SHA512 checksums verified"
 
-          # Download SHA512 checksums
-          curl --fail --show-error --location --retry 3 --retry-delay 5 \
-            -o solr-operator.tgz.sha512 "${{ inputs.solr-operator-chart-url }}.sha512"
+      # The checksums come from the same host as the charts, so on their own they only
+      # prove the download was not corrupted. The detached GPG signatures are what prove
+      # the artifacts are the ones the PMC voted on.
+      - name: Verify GPG signatures
+        working-directory: charts
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --silent --location "${ASF_KEYS_URL}" | gpg --import --quiet
+          for asc in ./*.tgz.asc; do
+            gpg --verify "${asc}" "${asc%.asc}"
+          done
+          echo "GPG signatures verified"
 
-          curl --fail --show-error --location --retry 3 --retry-delay 5 \
-            -o solr.tgz.sha512 "${{ inputs.solr-chart-url }}.sha512"
-
-          echo "Checksums downloaded:"
-          ls -lh *.sha512
-
-          # Verify SHA512 checksums
-          echo "Verifying solr-operator chart checksum..."
-          sha512sum -c solr-operator.tgz.sha512
-          echo "✓ solr-operator chart checksum verified"
-
-          echo "Verifying solr chart checksum..."
-          sha512sum -c solr.tgz.sha512
-          echo "✓ solr chart checksum verified"
-
-          echo ""
-          echo "✅ All checksums verified successfully"
-
-      - name: Extract Chart Versions
+      - name: Extract chart versions
         id: versions
+        working-directory: charts
+        env:
+          OPERATOR_CHART_FILE: ${{ steps.inputs.outputs.operator-chart-file }}
+          SOLR_CHART_FILE: ${{ steps.inputs.outputs.solr-chart-file }}
         run: |
-          # Extract version from solr-operator chart
-          OPERATOR_VERSION=$(tar -xzOf solr-operator.tgz solr-operator/Chart.yaml | grep '^version:' | awk '{print $2}')
-          echo "operator-version=${OPERATOR_VERSION}" >> $GITHUB_OUTPUT
-          echo "Solr Operator Chart Version: ${OPERATOR_VERSION}"
+          set -euo pipefail
+          OPERATOR_VERSION="$(tar -xzOf "${OPERATOR_CHART_FILE}" solr-operator/Chart.yaml | awk '$1 == "version:" {print $2; exit}')"
+          SOLR_VERSION="$(tar -xzOf "${SOLR_CHART_FILE}" solr/Chart.yaml | awk '$1 == "version:" {print $2; exit}')"
 
-          # Extract version from solr chart
-          SOLR_VERSION=$(tar -xzOf solr.tgz solr/Chart.yaml | grep '^version:' | awk '{print $2}')
-          echo "solr-version=${SOLR_VERSION}" >> $GITHUB_OUTPUT
-          echo "Solr Chart Version: ${SOLR_VERSION}"
+          echo "operator-version=${OPERATOR_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "solr-version=${SOLR_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Solr Operator chart version: ${OPERATOR_VERSION}"
+          echo "Solr chart version:          ${SOLR_VERSION}"
 
-      - name: Push solr-operator chart to OCI registry
+      - name: Log in to GitHub Container Registry
         if: ${{ !inputs.dry-run }}
         run: |
-          echo "Pushing solr-operator chart (version ${{ steps.versions.outputs.operator-version }}) to oci://docker.io/apache/solr-operator-chart"
-          helm push solr-operator.tgz oci://docker.io/apache/solr-operator-chart
-          echo "✓ solr-operator chart pushed successfully"
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "Logged in to ghcr.io"
 
-      - name: Push solr chart to OCI registry
+      - name: Push charts to OCI registry
         if: ${{ !inputs.dry-run }}
+        working-directory: charts
+        env:
+          OPERATOR_CHART_FILE: ${{ steps.inputs.outputs.operator-chart-file }}
+          SOLR_CHART_FILE: ${{ steps.inputs.outputs.solr-chart-file }}
         run: |
-          echo "Pushing solr chart (version ${{ steps.versions.outputs.solr-version }}) to oci://docker.io/apache/solr-chart"
-          helm push solr.tgz oci://docker.io/apache/solr-chart
-          echo "✓ solr chart pushed successfully"
+          set -euo pipefail
+          # helm appends each chart's name, so both charts share one push target.
+          helm push "${OPERATOR_CHART_FILE}" "${OCI_TARGET}"
+          helm push "${SOLR_CHART_FILE}" "${OCI_TARGET}"
 
-      - name: Dry Run Summary
-        if: ${{ inputs.dry-run }}
-        run: |
-          echo "## 🧪 Dry Run Mode - No Charts Published" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Validation Results" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ URLs validated from dist.apache.org" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Charts downloaded successfully" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Chart integrity verified (valid tarballs)" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ SHA512 checksums verified" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Chart versions extracted" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Chart Information" >> $GITHUB_STEP_SUMMARY
-          echo "- **Solr Operator Version**: \`${{ steps.versions.outputs.operator-version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Solr Chart Version**: \`${{ steps.versions.outputs.solr-version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
-          echo "Run this workflow again with **dry-run = false** to publish the charts to OCI registries." >> $GITHUB_STEP_SUMMARY
-
-      - name: Verify Published Charts
+      # Packages are created private by default on ghcr.io. Re-pulling anonymously is what
+      # catches that: it fails loudly rather than leaving a chart nobody can install.
+      - name: Verify published charts are anonymously pullable
         if: ${{ !inputs.dry-run }}
+        env:
+          OPERATOR_VERSION: ${{ steps.versions.outputs.operator-version }}
+          SOLR_VERSION: ${{ steps.versions.outputs.solr-version }}
+          OPERATOR_CHART_FILE: ${{ steps.inputs.outputs.operator-chart-file }}
+          SOLR_CHART_FILE: ${{ steps.inputs.outputs.solr-chart-file }}
         run: |
-          echo "Verifying charts are accessible from OCI registry..."
+          set -euo pipefail
+          helm registry logout ghcr.io || true
 
-          # Verify solr-operator chart
-          echo "Pulling solr-operator chart version ${{ steps.versions.outputs.operator-version }}..."
-          helm pull oci://docker.io/apache/solr-operator-chart --version ${{ steps.versions.outputs.operator-version }}
-          echo "✓ solr-operator chart verified"
+          # 'helm pull --verify' reads the pushed .prov, so this also proves provenance
+          # survived the round-trip. helm looks for the legacy public keyring.
+          gpg --export > ~/.gnupg/pubring.gpg
 
-          # Verify solr chart
-          echo "Pulling solr chart version ${{ steps.versions.outputs.solr-version }}..."
-          helm pull oci://docker.io/apache/solr-chart --version ${{ steps.versions.outputs.solr-version }}
-          echo "✓ solr chart verified"
+          mkdir -p pulled
+          helm pull --verify "${OCI_TARGET}/solr-operator" --version "${OPERATOR_VERSION}" -d pulled
+          helm pull --verify "${OCI_TARGET}/solr" --version "${SOLR_VERSION}" -d pulled
+
+          # The pulled charts must be byte-identical to the released ones.
+          cmp "pulled/${OPERATOR_CHART_FILE}" "charts/${OPERATOR_CHART_FILE}"
+          cmp "pulled/${SOLR_CHART_FILE}" "charts/${SOLR_CHART_FILE}"
+          echo "Charts are public, verifiable and identical to the released artifacts"
 
       - name: Summary
-        if: ${{ success() && !inputs.dry-run }}
+        if: ${{ success() }}
+        env:
+          OPERATOR_VERSION: ${{ steps.versions.outputs.operator-version }}
+          SOLR_VERSION: ${{ steps.versions.outputs.solr-version }}
         run: |
-          echo "## ✅ Successfully Published Helm Charts" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "The following charts have been published to OCI registries:" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Solr Operator Chart" >> $GITHUB_STEP_SUMMARY
-          echo "- **Registry**: \`oci://docker.io/apache/solr-operator-chart\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: \`${{ steps.versions.outputs.operator-version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Install**: \`helm install solr-operator oci://docker.io/apache/solr-operator-chart --version ${{ steps.versions.outputs.operator-version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Solr Chart" >> $GITHUB_STEP_SUMMARY
-          echo "- **Registry**: \`oci://docker.io/apache/solr-chart\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: \`${{ steps.versions.outputs.solr-version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Install**: \`helm install solr oci://docker.io/apache/solr-chart --version ${{ steps.versions.outputs.solr-version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Verification" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Charts downloaded and checksums verified" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Charts pushed to OCI registries" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Charts verified as accessible from OCI registry" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          REGISTRY="${OCI_TARGET}"
+
+          if [[ "${{ inputs.dry-run }}" == "true" ]]; then
+            echo "## Dry run - nothing was published" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Helm charts published" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| URLs from dist.apache.org | passed |"
+            echo "| SHA512 checksums | verified |"
+            echo "| GPG signatures | verified |"
+            echo "| solr-operator chart version | \`${OPERATOR_VERSION}\` |"
+            echo "| solr chart version | \`${SOLR_VERSION}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${{ inputs.dry-run }}" == "true" ]]; then
+            echo "Re-run with **dry-run = false** to publish." >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "Anonymously pulled back and verified against the released artifacts."
+              echo ""
+              echo '```bash'
+              echo "helm install solr-operator ${REGISTRY}/solr-operator --version ${OPERATOR_VERSION}"
+              echo "helm install example ${REGISTRY}/solr --version ${SOLR_VERSION}"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

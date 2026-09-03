@@ -1122,7 +1122,7 @@ groups:
           tee: true
   - !Todo
     id: publish_helm_charts_oci
-    title: Publish Helm charts to OCI registry (Docker Hub)
+    title: Publish Helm charts to the OCI registry (GHCR)
     depends: publish_helm_charts
     vars:
       dist_release_url: https://dist.apache.org/repos/dist/release/solr/solr-operator/{{ release_version }}
@@ -1130,11 +1130,13 @@ groups:
       solr_chart_url: '{{ dist_release_url }}/helm-charts/solr-{{ release_version[1:] }}.tgz'
       workflow_url: https://github.com/apache/solr-operator/actions/workflows/publish-helm-oci.yaml
     description: |
-      Publish the Helm charts to OCI registries on Docker Hub using the GitHub Actions workflow.
+      Publish the released Helm charts as OCI artifacts to the GitHub Container Registry,
+      using the "Publish Helm Charts to OCI Registry" GitHub Actions workflow.
 
-      This task publishes the voted Helm charts to OCI registries, making them available via:
-        - oci://docker.io/apache/solr-operator-chart
-        - oci://docker.io/apache/solr-chart
+      The charts on dist.apache.org remain the canonical, signed release artifacts.
+      The OCI copies are convenience binaries, published to:
+        - oci://ghcr.io/apache/solr-operator/helm/solr-operator
+        - oci://ghcr.io/apache/solr-operator/helm/solr
 
       Steps to publish:
       1. Navigate to the GitHub Actions workflow:
@@ -1145,24 +1147,33 @@ groups:
       3. Fill in the workflow inputs:
          - solr-operator-chart-url: {{ solr_operator_chart_url }}
          - solr-chart-url: {{ solr_chart_url }}
-         - dry-run: false (set to true for validation without publishing)
+         - dry-run: true
 
-      4. Optional: Run with dry-run=true first to verify:
-         - URLs are valid and accessible
-         - Charts download successfully
-         - SHA512 checksums match
-         - Chart versions are correct
+      4. The dry-run verifies, without publishing anything, that:
+         - The URLs are valid and point at dist.apache.org
+         - The charts, checksums, signatures and provenance files all download
+         - The SHA512 checksums match
+         - The GPG signatures verify against the Solr KEYS file
+         - The chart versions are what you expect
 
-      5. Click "Run workflow" to start the job
+      5. Re-run the workflow with dry-run = false to actually publish
 
-      6. Monitor the workflow execution for any errors
+      6. Monitor the workflow execution for any errors. After pushing, the workflow logs
+         out of the registry and pulls both charts back anonymously, verifying their
+         provenance and checking they are byte-identical to the released artifacts.
+         If this step fails with an authorization error, the ghcr.io packages are still
+         private and INFRA needs to make them public - see the note below.
 
-      7. Verify successful completion by checking that both charts are accessible:
-         helm pull oci://docker.io/apache/solr-operator-chart --version {{ release_version[1:] }}
-         helm pull oci://docker.io/apache/solr-chart --version {{ release_version[1:] }}
+      7. Confirm for yourself that the charts are installable, with no credentials:
 
-      Note: The workflow uses repository secrets DOCKERHUB_USER and DOCKERHUB_TOKEN for authentication.
-      The workflow automatically verifies SHA512 checksums before publishing.
+         helm registry logout ghcr.io
+         helm show chart oci://ghcr.io/apache/solr-operator/helm/solr-operator --version {{ release_version[1:] }}
+         helm show chart oci://ghcr.io/apache/solr-operator/helm/solr --version {{ release_version[1:] }}
+
+      Note: the workflow authenticates with the built-in GITHUB_TOKEN, so no secrets need
+      to be configured. However, ghcr.io creates new packages as *private*. The very first
+      time a chart name is published, an INFRA ticket is needed to make the package public.
+      This is a one-time action per chart name; later versions inherit the visibility.
     links:
       - '{{ workflow_url }}'
       - '{{ solr_operator_chart_url }}'
@@ -1233,7 +1244,8 @@ groups:
 
       The ChangeLog is very finicky, so make sure that it renders correctly.
 
-      Also verify that the OCI registry information is correctly displayed on ArtifactHub.
+      Note that ArtifactHub still indexes the HTTPS chart repository, not the OCI registry,
+      so the OCI copies published in the previous step will not show up here.
     links:
       - https://artifacthub.io/packages/helm/apache-solr/solr-operator
       - https://artifacthub.io/packages/helm/apache-solr/solr
