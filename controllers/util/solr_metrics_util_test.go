@@ -185,3 +185,15 @@ func TestCopyPodMonitorFieldsDetectsSpecChanges(t *testing.T) {
 	assert.True(t, CopyPodMonitorFields(wanted, drifted, logr.Discard()), "An update should be required after the PodMonitor spec was changed")
 	assert.Equal(t, wanted.Spec, drifted.Spec, "The PodMonitor spec should be reset to what the operator generated")
 }
+
+func TestCopyPodMonitorFieldsAddsAnEmptyValuedLabel(t *testing.T) {
+	solrCloud := podMonitorTestCloud(t)
+	existing := GeneratePodMonitor(solrCloud)
+
+	// An empty value is a valid label value, and a Prometheus can select on it
+	solrCloud.Spec.Prometheus.PodMonitor.Labels = map[string]string{"scrape": ""}
+	wanted := GeneratePodMonitor(solrCloud)
+
+	assert.True(t, CopyPodMonitorFields(wanted, existing, logr.Discard()), "An update should be required after an empty-valued label was added to the spec")
+	assert.Contains(t, existing.Labels, "scrape", "An empty-valued label must be put on the PodMonitor, so that a Prometheus selecting it finds the PodMonitor")
+}

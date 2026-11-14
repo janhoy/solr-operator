@@ -62,9 +62,10 @@ func CopyLabelsAndAnnotations(from, to *metav1.ObjectMeta, logger logr.Logger) (
 		to.Labels = make(map[string]string, len(from.Labels))
 	}
 	for k, v := range from.Labels {
-		if to.Labels[k] != v {
+		// An absent key is a change even when the wanted value is empty, which is a valid label value
+		if old, present := to.Labels[k]; !present || old != v {
 			requireUpdate = true
-			logger.Info("Update Label", "label", k, "newValue", v, "oldValue", to.Labels[k])
+			logger.Info("Update Label", "label", k, "newValue", v, "oldValue", old)
 			to.Labels[k] = v
 		}
 	}
@@ -73,9 +74,9 @@ func CopyLabelsAndAnnotations(from, to *metav1.ObjectMeta, logger logr.Logger) (
 		to.Annotations = make(map[string]string, len(from.Annotations))
 	}
 	for k, v := range from.Annotations {
-		if to.Annotations[k] != v {
+		if old, present := to.Annotations[k]; !present || old != v {
 			requireUpdate = true
-			logger.Info("Update Annotation", "annotation", k, "newValue", v, "oldValue", to.Annotations[k])
+			logger.Info("Update Annotation", "annotation", k, "newValue", v, "oldValue", old)
 			to.Annotations[k] = v
 		}
 	}
