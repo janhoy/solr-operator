@@ -19,6 +19,7 @@ package util
 
 import (
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +42,11 @@ var (
 	SecretReadOnlyPermissions int32 = 440
 	PublicReadOnlyPermissions int32 = 444
 )
+
+// ManagedLabelsAnnotation lists the label keys that the operator put on an object, so that a label
+// taken out of the SolrCloud spec can be taken off the object again without touching the labels that
+// someone else added.
+const ManagedLabelsAnnotation = "solr.apache.org/managedLabels"
 
 func Replicas(num int) *int32 {
 	num32 := int32(num)
@@ -81,6 +87,33 @@ func CopyLabelsAndAnnotations(from, to *metav1.ObjectMeta, logger logr.Logger) (
 		}
 	}
 
+	return requireUpdate
+}
+
+// ManagedLabelKeys formats the keys of the given labels for the ManagedLabelsAnnotation.
+func ManagedLabelKeys(labels map[string]string) string {
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
+// removeStaleManagedLabels deletes the labels that the operator put on the 'to' object earlier and no
+// longer wants, going by its ManagedLabelsAnnotation. Labels the operator never set are left alone.
+// Call before CopyLabelsAndAnnotations, which overwrites that annotation.
+func removeStaleManagedLabels(from, to *metav1.ObjectMeta, logger logr.Logger) (requireUpdate bool) {
+	for _, key := range strings.Split(to.Annotations[ManagedLabelsAnnotation], ",") {
+		if _, stillWanted := from.Labels[key]; stillWanted {
+			continue
+		}
+		if value, present := to.Labels[key]; present {
+			requireUpdate = true
+			logger.Info("Remove Label", "label", key, "oldValue", value)
+			delete(to.Labels, key)
+		}
+	}
 	return requireUpdate
 }
 
@@ -204,7 +237,10 @@ func CopyConfigMapFields(from, to *corev1.ConfigMap, logger logr.Logger) bool {
 // CopyPodMonitorFields copies the owned fields from one PodMonitor to another
 func CopyPodMonitorFields(from, to *monitoringv1.PodMonitor, logger logr.Logger) bool {
 	logger = logger.WithValues("kind", "podMonitor")
-	requireUpdate := CopyLabelsAndAnnotations(&from.ObjectMeta, &to.ObjectMeta, logger)
+	// The Prometheus instance selects the PodMonitor by its labels, so a label dropped from the spec
+	// has to come off the PodMonitor too, or that Prometheus keeps scraping the cloud.
+	requireUpdate := removeStaleManagedLabels(&from.ObjectMeta, &to.ObjectMeta, logger)
+	requireUpdate = CopyLabelsAndAnnotations(&from.ObjectMeta, &to.ObjectMeta, logger) || requireUpdate
 
 	// The whole spec is owned here, as the API server defaults nothing in it
 	if !DeepEqualWithNils(to.Spec, from.Spec) {

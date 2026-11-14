@@ -109,12 +109,15 @@ func GeneratePodMonitor(solrCloud *solr.SolrCloud) *monitoringv1.PodMonitor {
 		}
 	}
 
+	// The Prometheus instance selects the PodMonitor by its labels, so the user's labels win
+	labels := MergeLabelsOrAnnotations(options.Labels, solrCloud.SharedLabels())
+
 	return &monitoringv1.PodMonitor{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      solrCloud.PodMonitorName(),
-			Namespace: solrCloud.Namespace,
-			// The Prometheus instance selects the PodMonitor by its labels, so the user's labels win
-			Labels: MergeLabelsOrAnnotations(options.Labels, solrCloud.SharedLabels()),
+			Name:        solrCloud.PodMonitorName(),
+			Namespace:   solrCloud.Namespace,
+			Labels:      labels,
+			Annotations: map[string]string{ManagedLabelsAnnotation: ManagedLabelKeys(labels)},
 		},
 		Spec: monitoringv1.PodMonitorSpec{
 			Selector: metav1.LabelSelector{

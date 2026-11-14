@@ -186,6 +186,26 @@ func TestCopyPodMonitorFieldsDetectsSpecChanges(t *testing.T) {
 	assert.Equal(t, wanted.Spec, drifted.Spec, "The PodMonitor spec should be reset to what the operator generated")
 }
 
+func TestCopyPodMonitorFieldsReconcilesTheLabels(t *testing.T) {
+	solrCloud := podMonitorTestCloud(t)
+	solrCloud.Spec.Prometheus.PodMonitor.Labels = map[string]string{"release": "mon", "team": "search"}
+	existing := GeneratePodMonitor(solrCloud)
+	// A label that someone else put on the PodMonitor, which the operator does not manage
+	existing.Labels["added-by-policy"] = "yes"
+
+	// The user takes the cloud out of that Prometheus instance
+	delete(solrCloud.Spec.Prometheus.PodMonitor.Labels, "release")
+	wanted := GeneratePodMonitor(solrCloud)
+
+	assert.True(t, CopyPodMonitorFields(wanted, existing, logr.Discard()), "An update should be required after a label was dropped from the spec")
+	assert.NotContains(t, existing.Labels, "release", "A label dropped from the spec must come off the PodMonitor, or that Prometheus keeps scraping")
+	assert.Equal(t, "search", existing.Labels["team"], "The remaining labels of the spec must stay on the PodMonitor")
+	assert.Equal(t, "yes", existing.Labels["added-by-policy"], "A label that the operator never set is not the operator's to remove")
+	assert.Equal(t, "solr-cloud,team", existing.Annotations[ManagedLabelsAnnotation], "The annotation must list the labels that the operator now manages")
+
+	assert.False(t, CopyPodMonitorFields(wanted, existing, logr.Discard()), "No further update should be required once the labels are reconciled")
+}
+
 func TestCopyPodMonitorFieldsAddsAnEmptyValuedLabel(t *testing.T) {
 	solrCloud := podMonitorTestCloud(t)
 	existing := GeneratePodMonitor(solrCloud)
